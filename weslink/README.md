@@ -1,3 +1,10 @@
 
-[![Open with Colab](https://colab.research.google.com/assets/colab-badge.svg)]([https://github.com/ysut/ResearchClerkship/blob/main/weslink/weslink_jp.ipynb])
 
+- 遺伝子のシンボルが書いてある列
+- 染色体番号が書いてある列
+- ポジションが書いてある列
+- Refが書いてある列
+- Startが書いてある列
+- Endが書いてある列
+
+が必要です．
