@@ -5,12 +5,9 @@ import argparse
 from tqdm import tqdm
 import pysam
 import time
-
-'''
-ToDo
-- Start, End,列作る
-
-'''
+import openpyxl
+from excelutils import combine
+from hyperlinks import HyperLinks
 
 
 def parser_setting():
@@ -20,11 +17,19 @@ def parser_setting():
     parser.add_argument('--resources', '-r', required=True, 
                         type=pathlib.Path, help='path to resources directory')
     parser.add_argument('--gq', '-q', default=20, 
-                        type=pathlib.Path, help='GQ')
+                        type=int, help='GQ')
     parser.add_argument('--dp', '-d', default=10, 
-                        type=pathlib.Path, help='DP')
+                        type=int, help='DP')
     parser.add_argument('--ad', '-a', default=0.3, 
-                        type=pathlib.Path, help='AD')
+                        type=float, help='AD')
+    parser.add_argument('--ggm', '-g', default=0.01, 
+                        type=float, help='Cutoff of allele frequency for GGM')
+    parser.add_argument('--cadd', '-c', default=15, 
+                        type=float, help='Cutoff of CADD')
+    parser.add_argument('--revel', '-v', default=0.3, 
+                        type=float, help='Cutoff of REVEL')
+    parser.add_argument('--spliceai', '-s', default=0.1, 
+                        type=float, help='Cutoff of SpliceAI')
     args = vars(parser.parse_args())
 
     return args
@@ -58,6 +63,11 @@ def _remove_ver(df: pd.DataFrame, column: str) -> pd.DataFrame:
     return df
 
 
+def _end_col(row):
+    end = abs(int(len(row['REF'])) - int(len(row['ALT']))) + int(row['Start'])
+    return end
+
+
 def pre_proceesing(df: pd.DataFrame) -> pd.DataFrame:
     for rel in ['pro', 'pat', 'mat']:
         df = pd.concat(
@@ -81,7 +91,21 @@ def pre_proceesing(df: pd.DataFrame) -> pd.DataFrame:
     df['max_splai'] = np.nan
     df['REVEL'] = np.nan
 
+    # # For hyperlinks
+    # df['HGMD'] = 'HGMD'
+    # df['UCSC'] = 'UCSC'
+    # df['DECIPHER'] = 'DECIPHER'
+    # df['Franklin'] = 'Franklin'
+    # df['OMIM'] = 'OMIM'
+
+    # Make columns for Hyperlinks functions
+    df.rename(columns={'Ref': 'REF', 'Alt': 'ALT', 
+                       'Chr': 'CHROM', 'Position': 'POS'}, inplace=True)
+    df['Start'] = df['POS']
+    df['End'] = df.apply(_end_col, axis=1)  
+
     return df
+
 
 @print_filtering_count
 def quality_check(df: pd.DataFrame, gq: int, dp: int) -> pd.DataFrame:
@@ -91,18 +115,25 @@ def quality_check(df: pd.DataFrame, gq: int, dp: int) -> pd.DataFrame:
             & (df['DP(pat)'] >= dp)
             & (df['GQ(mat)'] >= gq)
             & (df['DP(mat)'] >= dp)]
+
     return df
+
 
 @print_filtering_count
 def exclude_low_ad(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
     df['prc.AD'] = df['AD(pro)'].div(df['DP(pro)'], axis=0)
     df = df[df['prc.AD'] > threshold]
+
     return df
+
 
 @print_filtering_count
 def exclude_identified_variants(df: pd.DataFrame) -> pd.DataFrame:
-    df = df[df['Analysis status'] != 'Identified']
+    df = df[(df['Analysis status'] != 'Identified') 
+            & (df['Analysis status'] != 'identified')]
+
     return df
+
 
 @print_filtering_count
 def exclude_ggm_common(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
@@ -124,6 +155,7 @@ def exclude_low_splai(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
                & (df['max_splai'] <= threshold))]
     
     return df
+
 
 def annotate_gnomad(df: pd.DataFrame) -> pd.DataFrame:
     gnomad = load_file(input_file=gnomad_file, type='tsv')
@@ -162,8 +194,8 @@ def annotate_splai(df: pd.DataFrame) -> pd.DataFrame:
     splai_indel = '/bulk/SpliceAI/spliceai_scores.masked.indel.hg19.vcf.gz'
     tbx_snv = pysam.TabixFile(splai_snv)
     tbx_indel = pysam.TabixFile(splai_indel)
-    chr_col = df.columns.get_loc('Chr')
-    pos_col = df.columns.get_loc('Position')
+    chr_col = df.columns.get_loc('CHROM')
+    pos_col = df.columns.get_loc('POS')
     splai_col = df.columns.get_loc('SpliceAI_INFO')
     var_id_sr = df['variant_id']  
 
@@ -226,9 +258,9 @@ def insert_maxsplai(df: pd.DataFrame) -> pd.DataFrame:
 def annotate_revel(df: pd.DataFrame) -> pd.DataFrame:
     print('Annotating REVEL scores')
     # revel = '/bulk/REVEL/revel.nonheader.vcf.gz'
-    tbx_revel = pysam.TabixFile(revel)
-    chr_col = df.columns.get_loc('Chr')
-    pos_col = df.columns.get_loc('Position')
+    tbx_revel = pysam.TabixFile(revel_file)
+    chr_col = df.columns.get_loc('CHROM')
+    pos_col = df.columns.get_loc('POS')
     ens_cano_col = df.columns.get_loc('Ense.canonical')
     revel_col = df.columns.get_loc('REVEL')
     var_id_sr = df['variant_id']  
@@ -280,7 +312,7 @@ def classify_inheritance_model(df: pd.DataFrame) -> tuple:
     
     df_ch = df[(df['exp.MOI'] != 'AD')
                & ((df['Vtype'] == 'ch_fa')
-                   | (df['Vtype'] == 'ch_ma')
+                   | (df['Vtype'] == 'ch_mo')
                    | (df['Vtype'] == 'denovo'))]
 
     return df_denovo, df_ch, df_homo
@@ -293,9 +325,9 @@ def _create_sample_gene_var_col(row):
     return row['Sample'] + '-' + row['Gene'] + '-' + row['Vtype']
 
 def _chfunc(row):
-    if row['sg_count'] == 1:
+    if row['SG_count'] == 1:
         return '.'
-    elif row['sg_count'] == row['sgv_count']:
+    elif row['SG_count'] == row['SGV_count']:
         return '.'
     else:
         return 'PASS'
@@ -303,33 +335,14 @@ def _chfunc(row):
 def filtering_ch(df: pd.DataFrame) -> pd.DataFrame:
     df['smpl_gene'] = df.apply(_create_sample_gene_col, axis=1)
     df['smpl_gene_var'] = df.apply(_create_sample_gene_var_col, axis=1)
-    series = df.groupby('smpl_gene')['smpl_gene'].transform('count').rename('sg_count')
+    series = df.groupby('smpl_gene')['smpl_gene'].transform('count').rename('SG_count')
     df = pd.concat([df, series], axis=1)
-    series = df.groupby('smpl_gene_var')['smpl_gene_var'].transform('count').rename('sgv_count')
+    series = df.groupby('smpl_gene_var')['smpl_gene_var'].transform('count').rename('SGV_count')
     df = pd.concat([df, series], axis=1)
     df['CH_filter'] = df.apply(_chfunc, axis=1)
     
     return df
 
-def _filter_low_cadd(x, **kwargs):
-    if x >= float(kwargs['cadd']):
-        return 'PASS'
-    else:
-        return '--'
-
-def _filter_low_revel(x, **kwargs):
-    if x >= float(kwargs['revel']):
-        return 'PASS'
-    else:
-        return '--'
-
-def revelcadd(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.replace({'CADD': {'-': 9999}})
-    df = df.astype({'CADD': float, 'REVEL': float})
-    df['CADD_Filter'] = df.apply(_filter_low_cadd, cadd=15)
-    df['REVEL_Filter'] = df.apply(_filter_low_revel, revel=0.23)
-
-    return df
 
 @print_filtering_count
 def exclude_low_cadd(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
@@ -337,6 +350,7 @@ def exclude_low_cadd(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
     df = df.astype({'CADD': float})
     df = df[~((df['CADD'] >= 0) & (df['CADD'] < threshold))]
     df = df.replace({'CADD': {np.nan: '.'}}) 
+    
     return df
 
 
@@ -345,31 +359,31 @@ def exclude_low_revel(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
     df = df.astype({'REVEL': float})
     df = df[~((df['REVEL'] >= 0) & (df['REVEL'] < threshold))]
     df = df.replace({'REVEL': {np.nan: '.'}}) 
+    
     return df
 
 
-
 def order_cols(df: pd.DataFrame) -> pd.DataFrame:
-    # df.drop(columns=df.columns[0])
+    df.drop(columns=df.columns[0])
     re_order_cols = ['Sample', 'Disease', 'HGMD.disease', 
        'Gene', 'DM', 'LOEUF', 'exp.MOI', 'Vtype', 'CH_filter', 
        'Effect', 'variant_id', 'max_splai', 'REVEL', 'CADD', 'SIFT', 
-       'PolyPhen-2', 'MutationTaster', 'Impact', 
-       'Transcript', 'Amino acid change2',  
-       'Chr', 'Position', 'Ref', 'Alt', 'Distance', 'alleleID',
-       'GGM(AC/AN)', 'ToMMo3.5K(AC)', 'ToMMo3.5K(AN)', 'ToMMo3.5K(AF)',
-       'JPNCTL(SC)', 'JPNCTL(SN)', 'ExAC(AC)', 'ExAC(AF)', 'gnomAD(AC)',
-       'gnomAD(AN)', 'gnomAD(AF)', 'Family', 
-       'ID(pro)','AS(pro)', 'GT(pro)', 'GQ:DP:AD(pro)', 
-       'ID(pat)', 'AS(pat)', 'GT(pat)','GQ:DP:AD(pat)', 
-       'ID(mat)', 'AS(mat)', 'GT(mat)', 'GQ:DP:AD(mat)',
-       'GQ(pro)','DP(pro)', 'AD(pro)', 
-       'GQ(pat)','DP(pat)', 'AD(pat)', 
+       'PolyPhen-2', 'MutationTaster', 'pLI', 'pRec', 'syn_z', 'mis_z', 
+       'Impact', 'Transcript', 'Amino acid change2',  
+       'CHROM', 'POS', 'REF', 'ALT', 'Distance', 
+       'GGM.AC', 'GGM.AF', 'ToMMo3.5K(AC)', 'ToMMo3.5K(AN)', 'ToMMo3.5K(AF)',
+       'JPNCTL(SC)', 'JPNCTL(SN)', 'gnomAD(AC)', 'gnomAD(AN)', 'gnomAD(AF)', 
+       'ExAC(AC)', 'ExAC(AF)', 'ID(pro)','AS(pro)', 'GT(pro)', 
+       'ID(pat)', 'AS(pat)', 'GT(pat)', 'ID(mat)', 'AS(mat)', 'GT(mat)', 
+       'GQ(pro)','DP(pro)', 'AD(pro)', 'prc.AD', 'GQ(pat)','DP(pat)', 'AD(pat)', 
        'GQ(mat)','DP(mat)', 'AD(mat)', 
        'acp.gain', 'acp.loss', 'dnr.gain', 'dnr.loss', 
        'acp.gain_pos', 'acp.loss_pos', 'dnr.gain_pos','dnr.loss_pos', 
-       'omimid', 'MANE_ENST', 'ENSP', 'Analysis status']
+       'GQ:DP:AD(pro)', 'GQ:DP:AD(pat)', 'GQ:DP:AD(mat)', 'GGM(AC/AN)',
+       'Family', 'alleleID', 'omimid', 'MANE_ENST', 'ENSP', 'Analysis status',
+       'GGM.AN', 'Start', 'End', 'smpl_gene', 'smpl_gene_var']
     df = df.reindex(columns=re_order_cols)
+    print(len(df))
 
     return df
 
@@ -385,17 +399,13 @@ def output_tsv(dfs: list, outputs: list):
     for df, output in zip(dfs, outputs):
         df.to_csv(output, sep='\t', index=False)
 
-def _end_col(row):
-    end = abs(int(len(row['REF'])) - int(len(row['ALT']))) + int(row['Start'])
-    return end
 
-def renamecol(df: pd.DataFrame) -> pd.DataFrame:
-    df.rename(columns={'Ref': 'REF', 'Alt': 'ALT', 
-                       'Chr': 'CHROM', 'Position': 'POS'}, inplace=True)
-    df['Start'] = df['POS']
-    df['End'] = df.apply(_end_col, axis=1)  
+def to_excel(df: pd.DataFrame, output, fileName):
+    df.to_excel(f'{output}_{fileName}.xlsx', index=False)
 
-    return df
+    return f'{output}_{fileName}.xlsx'
+
+
 
 if __name__ == "__main__":
     args = parser_setting()
@@ -404,10 +414,14 @@ if __name__ == "__main__":
     gq = args['gq']
     dp = args['dp']
     ad = args['ad']
+    ggm = args['ggm']
+    cadd = args['cadd']
+    revel = args['revel']
+    spliceai = args['spliceai']
     gnomad_file = f'{resources}/gnomAD_constraint_metrics/gnomad.v2.1.1.lof_metrics.by_gene.txt'
     hgmd_file = f'{resources}/HGMD_info/HGMD_2023.1.dmcount.info.decode.txt'
     mane_file = f'{resources}/MANE_select/MANE.GRCh38.v1.1.summary.txt.gz'
-    revel = f'{resources}/REVEL/revel.nonheader.vcf.gz'
+    revel_file = f'{resources}/REVEL/revel.nonheader.vcf.gz'
     splai_snv = f'{resources}/SpliceAI/spliceai_scores.masked.snv.hg19.vcf.gz'
     splai_indel = f'{resources}/SpliceAI/spliceai_scores.masked.indel.hg19.vcf.gz'
 
@@ -416,11 +430,11 @@ if __name__ == "__main__":
     df = pre_proceesing(df)
     print(f'All variants: {len(df)}\n')
 
+    df = exclude_identified_variants(df)
     df = quality_check(df, gq=gq, dp=dp)
     df = exclude_low_ad(df, threshold=ad)
-    df = exclude_ggm_common(df, threshold=0.05)
-    df = exclude_identified_variants(df)
-    df = exclude_low_cadd(df, threshold=15)
+    df = exclude_ggm_common(df, threshold=ggm)
+    df = exclude_low_cadd(df, threshold=cadd)
 
     print('Annotating ......\n')
     df = annotate_splai(df)
@@ -430,22 +444,34 @@ if __name__ == "__main__":
     df = annotate_mane(df)
     df = annotate_revel(df)
 
-    df = exclude_low_splai(df, threshold=0.1)
-    df = exclude_low_revel(df, threshold=0.25)
+    df = exclude_low_splai(df, threshold=spliceai)
+    df = exclude_low_revel(df, threshold=revel)
 
     df = order_cols(df)
-    df = renamecol(df)
 
-    print('Classify by model ......\n')
+    print('Classify by inheritance models ......\n')
     df_denovo, df_ch, df_homo = classify_inheritance_model(df)
     df_ch = filtering_ch(df_ch)
 
     print(f'Remaining Variants: \ndenovo: {len(df_denovo)}\nch    : {len(df_ch)}\nhomo  : {len(df_homo)}\n')
     print(f'\nCompleted!! \n\n')
 
-    output=configure_output(input_file)
-    output_list = [f'{output}.denovo.tsv',
-                   f'{output}.ch.tsv',
-                   f'{output}.homo.tsv']
-    output_tsv(dfs=[df_denovo, df_ch, df_homo], 
-               outputs=output_list)
+    output=configure_output(input_file)     
+    dfs = [df_denovo, df_ch, df_homo]
+    titles = ['denovo', 'ch', 'homo']
+    excel_files = []
+   
+    for df, excel_name in zip(dfs, titles):
+        excel_file = to_excel(df, output, excel_name)
+        excel_files.append(excel_file)
+
+    master_wb = combine(excel_files, titles)
+    master_xlsx = f'{output}_master.xlsx'
+    master_wb.save(master_xlsx)
+
+    hyperlinks = HyperLinks(master_xlsx, hgmd_link=1, ucsc_link=2, 
+                            omim_link=3, franklin_link=5, decipher_link=4, 
+                            symbol_col='Gene', omimid_col='omimid')
+    hyperlinks.all_links()
+
+
